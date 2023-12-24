@@ -105,7 +105,9 @@ if [[ -n "$(find "$data_path/samples" -maxdepth 0 -type d -empty 2>/dev/null)" ]
 
     for audio_file in $(find "$data_path/ami_unpacked/ihm/EN2002a" -maxdepth 1 -type f -name "*.wav" | head -n 10 | tr '\n' ' '); do
         echo "$audio_file"
-        ffmpeg -i "$audio_file" -c:a copy -map 0 -acodec u16le $data_path/samples/$(basename "$audio_file")
+        SAMPLE_RATE=16000
+        #from https://github.com/openai/whisper/blob/main/whisper/audio.py#L45C5-L55C6
+        ffmpeg -nostdin -threads 0 -i "$audio_file" -f s16le -ac 1 -acodec pcm_s16le -ar $SAMPLE_RATE $data_path/samples/$(basename "$audio_file")
         #output=$data_path/samples/$(basename "$audio_file")
         #echo $output
         #sox "$audio_file" -r 16000 $output

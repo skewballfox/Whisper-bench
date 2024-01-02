@@ -7,8 +7,6 @@ data_path=$top_dir/data
 results_path=$top_dir/results
 
 mkdir -p $model_path $data_path $results_path/{bench/{md,json},output}/{cpu,gpu} $top_dir/bin
-# this is just laziness
-rm -r $results_path/output/md
 
 # need a version both whisper and ctranslate2 can use
 python_cmd=$(compgen -c python3. | grep -E '^python3.(9|1[0,1])$' | sort -r | head -n 1)
@@ -97,6 +95,15 @@ setup_venv() {
 
 }
 
+use_venv() {
+    venv_check
+    local project_dir=$1
+    source $project_dir/.venv/bin/activate
+    echo "Virtual Env: $VIRTUAL_ENV"
+}
+export -f use_venv
+export -f venv_check
+
 setup_venv original
 setup_venv "ctranslate2"
 
@@ -107,10 +114,7 @@ if [[ -n "$(find "$data_path/samples" -maxdepth 0 -type d -empty 2>/dev/null)" ]
         echo "$audio_file"
         SAMPLE_RATE=16000
         #from https://github.com/openai/whisper/blob/main/whisper/audio.py#L45C5-L55C6
-        ffmpeg -nostdin -threads 0 -i "$audio_file" -f s16le -ac 1 -acodec pcm_s16le -ar $SAMPLE_RATE $data_path/samples/$(basename "$audio_file")
-        #output=$data_path/samples/$(basename "$audio_file")
-        #echo $output
-        #sox "$audio_file" -r 16000 $output
+        ffmpeg -nostdin -threads 0 -i "$audio_file" -ac 1 -acodec pcm_s16le -ar $SAMPLE_RATE $data_path/samples/$(basename "$audio_file")
     done
 
 fi
@@ -122,16 +126,39 @@ ihm_files=${ihm_files::-1}
 # ihm_files=${ihm_files::-1}
 #echo $ihm_files
 
+# function to run the programs with hyperfine
+# Arguments:
+#   $1: project directory: used to set the output directory
+#   $2: device: cpu or gpu
+#   $3: command: the command to run
+#   $4: debug: if debug is set to "debug", print out the inputs to hyperfine and show the output of the command being benchmarked
 hyperfine_bench() {
     local derby_contender=$(basename $1)
-    local command=$2
-    local bench_results_path=$results_path/bench/json/$3/$derby_contender.json
-    echo $command
-    hyperfine --warmup 3 --runs 10 -N \
+    local device=$2
+    local command=$3
+    local debug=$4
+    local bench_results_path=$results_path/bench/json/$device/$derby_contender.json
+    if [ -n "$debug" ] && [ "$debug" == "debug" ]; then
+        echo -e "debugging\n"
+        echo -e "bench results path: $bench_results_path\n"
+        echo -e "input files:\n $ihm_files\n"
+        echo -e "command:\n $command\n"
+        echo -e "Virtual Env: $VIRTUAL_ENV\n"
+        local show="--show-output"
+    fi
+    hyperfine --warmup 3 --runs 10 -N $show \
         --export-json $results_path/bench/json/$device/$derby_contender.json --export-markdown $results_path/bench/md/$device/$derby_contender.md \
-        --parameter-list input_file $ihm_files "${command}"
+        --parameter-list input_file $ihm_files "$command"
 }
 
+# function to run the python programs with hyperfine
+# Arguments:
+#   $1: project directory: used to set the output directory
+#   $2: command: the command to run
+#   $3: model_directory: the directory of the model
+#   $4: model_name: the name of the model
+#   $5: device: cpu or gpu
+#   $6: debug: if debug is set, print out the inputs to hyperfine and show the output of the command being benchmarked
 bench_python() {
     venv_check
     local project_dir=$1
@@ -140,10 +167,28 @@ bench_python() {
     local model_directory=$3
     local model_name=$4
     local device=$5
+    if [ $device == "gpu" ] && [ -n "$(command -v nvidia-smi)" ]; then
+        device="cuda"
+    fi
+    local debug=$6
     source $project_dir/.venv/bin/activate
-    command="python -m $command {input_file} --device cpu --model $model_name --model_dir $model_directory --output_dir $results_path/output/$device/$contender --output_format json 2&>1 >/dev/null"
-    hyperfine_bench $project_dir "${command}" $device
+    command="$command {input_file} --device $device --model $model_name --model_dir $model_directory --output_dir $results_path/output/$device/$contender --output_format json"
+    hyperfine_bench $project_dir "$device" "${command}" "$debug"
 
+}
+
+echo_python() {
+    local project_dir=$1
+    local contender=$(basename $project_dir)
+    local command=$2
+    local model_directory=$3
+    local model_name=$4
+    local device=$5
+    if [ $device == "gpu" ] && [ -n "$(command -v nvidia-smi)" ]; then
+        device="cuda"
+    fi
+    command="$command {input_file} --device $device --model $model_name --model_dir $model_directory --output_dir $results_path/output/$device/$contender --output_format json"
+    echo -e "${command}"
 }
 
 rust_config() {
@@ -157,12 +202,64 @@ rust_config() {
     cd $top_dir
 
 }
+# function to run all the programs using a specific device (cpu or gpu)
+# Arguments:
+#   $1: device: cpu or gpu
+#   $2: debug: if debug is set to "debug", print out the inputs to hyperfine and show the output of the command being benchmarked
+# Note: you really shouldn't run this with debug set, it will take a long time
+run_benches() {
+    local device=$1
 
-bench_python "${top_dir}/original" "whisper" "${model_path}" "medium.en" "cpu"
-bench_python "${top_dir}/ctranslate2" "whisper-ctranslate2" "${model_path}" "medium.en" "cpu"
-#rust_config "${top_dir}/burn" "transcribe" --features wgpu-backend
-rust_config "${top_dir}/burn" "/examples/whisper"
+    bench_python "${top_dir}/original" "whisper" "${model_path}" "medium.en" "$device"
+    bench_python "${top_dir}/ctranslate2" "whisper-ctranslate2" "${model_path}" "medium.en" "$device"
+    if [[ "$device" == "gpu" ]]; then
+        hyperfine_bench "${top_dir}/burn" "$device" "$top_dir/bin/transcribe medium.en {input_file} en $results_path/output/gpu/burn"
+        hyperfine_bench "${top_dir}/candle" "$device" "$top_dir/bin/whisper --model medium.en --language en --input {input_file}"
+    else
+        hyperfine_bench "${top_dir}/candle" "$device" "$top_dir/bin/whisper --model medium.en --language en --input {input_file} --$device"
+    fi
+
+}
+
+run_group_benches() {
+    local device=$1
+    export -f use_venv
+    export -f venv_check
+    commands=()
+
+    commands+=(--prepare "use_venv ${top_dir}/original")
+    commands+=("'$(echo_python ${top_dir}/original whisper ${model_path} medium.en $device)'")
+
+    commands+=(--prepare "'use_venv ${top_dir}/ctranslate2'")
+    commands+=("'$(echo_python ${top_dir}/ctranslate2 whisper-ctranslate2 ${model_path} medium.en $device)'")
+
+    commands+=(--prepare "'echo yeet'")
+    if [[ "$device" == "gpu" ]]; then
+        commands+=("'$top_dir/bin/whisper --model medium.en --language en --input {input_file}'")
+        commands+=(--prepare "'echo yeet'")
+        commands+=("'$top_dir/bin/transcribe medium.en {input_file} en $results_path/output/gpu/burn'")
+    else
+        commands+=("'$top_dir/bin/whisper --model medium.en --language en --input {input_file} --$device'")
+    fi
+    echo "${commands[*]}"
+    hyperfine --warmup 3 --runs 10 --show-output \
+        --parameter-list input_file $ihm_files \
+        --export-json $results_path/bench/json/$device/group.json --export-markdown $results_path/bench/md/$device/group.md \
+        "${commands[@]}"
+
+}
+
+#bench_python "${top_dir}/original" "whisper" "${model_path}" "medium.en" "cpu" "debug"
+#bench_python "${top_dir}/ctranslate2" "whisper-ctranslate2" "${model_path}" "medium.en" "cpu" "debug"
+# #rust_config "${top_dir}/burn" "transcribe" --features wgpu-backend
+
 #transcribe <model name> <audio file> <lang> <transcription file>
 #hyperfine_bench "${top_dir}/burn" "$top_dir/bin/transcribe medium.en {input_file} en $results_path/output/cpu/burn" "cpu"
 #where is the model being cached?
-hyperfine_bench "${top_dir}/candle" "$top_dir/bin/whisper --model medium.en --language en --input {input_file} --input {input_file}" "cpu"
+# command="$top_dir/bin/whisper --model medium.en --language en --input {input_file} --cpu"
+# hyperfine_bench "${top_dir}/candle" "cpu" "$top_dir/bin/whisper --model medium.en --language en --input {input_file} --cpu"
+#rust_config "${top_dir}/candle" "/examples/whisper"
+#rust_config "${top_dir}/burn" "transcribe" --features wgpu-backend
+#run_benches "cpu"
+#run_benches "gpu"
+run_group_benches "cpu"

@@ -227,11 +227,11 @@ run_group_benches() {
     export -f venv_check
     commands=()
 
-    commands+=(--prepare "use_venv ${top_dir}/original")
-    commands+=("'$(echo_python ${top_dir}/original whisper ${model_path} medium.en $device)'")
+    commands+=(--prepare "\"use_venv ${top_dir}/original --activate\"")
+    commands+=("$(echo_python ${top_dir}/original whisper ${model_path} medium.en $device)")
 
-    commands+=(--prepare "'use_venv ${top_dir}/ctranslate2'")
-    commands+=("'$(echo_python ${top_dir}/ctranslate2 whisper-ctranslate2 ${model_path} medium.en $device)'")
+    commands+=(--prepare "use_venv ${top_dir}/ctranslate2")
+    commands+=("$(echo_python ${top_dir}/ctranslate2 whisper-ctranslate2 ${model_path} medium.en $device)")
 
     commands+=(--prepare "'echo yeet'")
     if [[ "$device" == "gpu" ]]; then
@@ -241,11 +241,11 @@ run_group_benches() {
     else
         commands+=("'$top_dir/bin/whisper --model medium.en --language en --input {input_file} --$device'")
     fi
-    echo "${commands[*]}"
+    echo ${commands[@]}
     hyperfine --warmup 3 --runs 10 --show-output \
         --parameter-list input_file $ihm_files \
         --export-json $results_path/bench/json/$device/group.json --export-markdown $results_path/bench/md/$device/group.md \
-        "${commands[@]}"
+        ${commands[@]}
 
 }
 

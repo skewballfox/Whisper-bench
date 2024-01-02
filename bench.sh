@@ -6,8 +6,6 @@ model_path=$top_dir/models
 data_path=$top_dir/data
 results_path=$top_dir/results
 
-mkdir -p $model_path $data_path $results_path/{bench/{md,json},output}/{cpu,gpu} $top_dir/bin
-
 # need a version both whisper and ctranslate2 can use
 python_cmd=$(compgen -c python3. | grep -E '^python3.(9|1[0,1])$' | sort -r | head -n 1)
 echo $python_cmd
@@ -17,6 +15,8 @@ if [[ "$python_cmd" == "" ]]; then
     echo "please install python 3.9, 3.10, or 3.11"
     exit 1
 fi
+
+mkdir -p $model_path $data_path $results_path/{bench/{md,json},output}/{cpu,gpu} $top_dir/bin
 
 # Clone the repositories if they don't exist
 
@@ -36,18 +36,18 @@ if [ ! -d "candle" ]; then
     git clone https://github.com/huggingface/candle.git candle
 fi
 
-# if [ ! -d "tract"]; then
-#     git clone https://github.com/igor-yusupov/rusty-whisper/
-# fi
+if [ ! -d "tract"]; then
+    git clone https://github.com/igor-yusupov/rusty-whisper/
+fi
 
-# # Clone the models if they don't exist
-# if [ ! -d "$model_path/whisper-medium.en" ]; then
-#     git -C $model_path lfs clone https://huggingface.co/openai/whisper-medium.en
-# fi
+# Clone the models if they don't exist
+if [ ! -d "$model_path/whisper-medium.en" ]; then
+    git -C $model_path lfs clone https://huggingface.co/openai/whisper-medium.en
+fi
 
-# if [ ! -d "$model_path/faster-whisper-medium.en" ]; then
-#     git -C $model_path lfs clone https://huggingface.co/Systran/faster-whisper-medium.en
-# fi
+if [ ! -d "$model_path/faster-whisper-medium.en" ]; then
+    git -C $model_path lfs clone https://huggingface.co/Systran/faster-whisper-medium.en
+fi
 
 # Clone the data if it doesn't exist
 if [ ! -d "$data_path/ami" ]; then
@@ -95,6 +95,23 @@ setup_venv() {
 
 }
 
+# function to build the rust programs and copy the binaries to the bin directory
+# Arguments:
+#   $1: project directory: the directory of the project
+#   $2: binary: the name of the binary to copy
+#   $3: flags: the flags to pass to cargo build
+rust_config() {
+    local project_dir=$1
+    local binary=$2
+    shift 2
+    local flags=$@
+    cd $project_dir
+    cargo build --release ${flags[@]}
+    cp target/release/$binary $top_dir/bin/
+    cd $top_dir
+
+}
+
 use_venv() {
     venv_check
     local project_dir=$1
@@ -119,11 +136,12 @@ if [[ -n "$(find "$data_path/samples" -maxdepth 0 -type d -empty 2>/dev/null)" ]
 
 fi
 ihm_files=$(find "$data_path/samples" -maxdepth 1 -type f -name "*.wav" | head -n 10 | tr '\n' ',')
-#toss the last comma
+toss the last comma
 ihm_files=${ihm_files::-1}
 # ihm_files=$(find "$data_path/ami_unpacked/ihm/EN2002a" -maxdepth 1 -type f -name "*.wav" | head -n 10 | tr '\n' ',') # | sed "s!$data_path/ami_unpacked/ihm/EN2002a/!!g")
 # #toss the last comma
 # ihm_files=${ihm_files::-1}
+
 #echo $ihm_files
 
 # function to run the programs with hyperfine
@@ -188,20 +206,9 @@ echo_python() {
         device="cuda"
     fi
     command="$command {input_file} --device $device --model $model_name --model_dir $model_directory --output_dir $results_path/output/$device/$contender --output_format json"
-    echo -e "${command}"
+    echo -en "'${command}'"
 }
 
-rust_config() {
-    local project_dir=$1
-    local binary=$2
-    shift 2
-    local flags=$@
-    cd $project_dir
-    cargo build --release
-    cp target/release/$binary $top_dir/bin/
-    cd $top_dir
-
-}
 # function to run all the programs using a specific device (cpu or gpu)
 # Arguments:
 #   $1: device: cpu or gpu
@@ -220,32 +227,36 @@ run_benches() {
     fi
 
 }
-
+# function to run all the programs using a specific device (cpu or gpu)
+# Arguments:
+#   $1: device: cpu or gpu
+# Note: burn only works on gpu
 run_group_benches() {
     local device=$1
     export -f use_venv
     export -f venv_check
-    commands=()
 
-    commands+=(--prepare "\"use_venv ${top_dir}/original --activate\"")
-    commands+=("$(echo_python ${top_dir}/original whisper ${model_path} medium.en $device)")
+    original="$(echo_python ${top_dir}/original whisper ${model_path} medium.en $device)"
 
-    commands+=(--prepare "use_venv ${top_dir}/ctranslate2")
-    commands+=("$(echo_python ${top_dir}/ctranslate2 whisper-ctranslate2 ${model_path} medium.en $device)")
-
-    commands+=(--prepare "'echo yeet'")
+    ctranslate2+="$(echo_python ${top_dir}/ctranslate2 whisper-ctranslate2 ${model_path} medium.en $device)"
+    candle=("$top_dir/bin/whisper --model medium.en --language en --input {input_file} --$device")
     if [[ "$device" == "gpu" ]]; then
-        commands+=("'$top_dir/bin/whisper --model medium.en --language en --input {input_file}'")
-        commands+=(--prepare "'echo yeet'")
-        commands+=("'$top_dir/bin/transcribe medium.en {input_file} en $results_path/output/gpu/burn'")
+        burn=("$top_dir/bin/transcribe medium.en {input_file} en $results_path/output/gpu/burn")
+        hyperfine --warmup 3 --runs 10 --show-output \
+            --parameter-list input_file $ihm_files \
+            --export-json $results_path/bench/json/$device/group.json --export-markdown $results_path/bench/md/$device/group.md \
+            --prepare "use_venv $top_dir/original --activate" "${original}" \
+            --prepare "use_venv $top_dir/ctranslate2 --activate" "${ctranslate2}" \
+            --prepare "true" "${candle%--$device}" \
+            --prepare "true" "${burn}"
     else
-        commands+=("'$top_dir/bin/whisper --model medium.en --language en --input {input_file} --$device'")
+        hyperfine --warmup 3 --runs 10 --show-output \
+            --parameter-list input_file $ihm_files \
+            --export-json $results_path/bench/json/$device/group.json --export-markdown $results_path/bench/md/$device/group.md \
+            --prepare "use_venv $top_dir/original --activate" "${original}" \
+            --prepare "use_venv $top_dir/ctranslate2 --activate" "${ctranslate2}" \
+            --prepare "true" "${candle}"
     fi
-    echo ${commands[@]}
-    hyperfine --warmup 3 --runs 10 --show-output \
-        --parameter-list input_file $ihm_files \
-        --export-json $results_path/bench/json/$device/group.json --export-markdown $results_path/bench/md/$device/group.md \
-        ${commands[@]}
 
 }
 
@@ -258,8 +269,8 @@ run_group_benches() {
 #where is the model being cached?
 # command="$top_dir/bin/whisper --model medium.en --language en --input {input_file} --cpu"
 # hyperfine_bench "${top_dir}/candle" "cpu" "$top_dir/bin/whisper --model medium.en --language en --input {input_file} --cpu"
-#rust_config "${top_dir}/candle" "/examples/whisper"
-#rust_config "${top_dir}/burn" "transcribe" --features wgpu-backend
-#run_benches "cpu"
-#run_benches "gpu"
-run_group_benches "cpu"
+rust_config "${top_dir}/candle" "/examples/whisper"
+rust_config "${top_dir}/burn" "transcribe" --features wgpu-backend
+run_benches "cpu"
+run_benches "gpu"
+#run_group_benches "gpu"
